@@ -1,88 +1,125 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-rem 使用 UTF-8，中文訊息較不易亂碼（可依你環境調整）
-chcp 65001 >nul
 
-rem 讓工作目錄切到這個 bat 檔所在資料夾
+REM Go to script directory
 cd /d "%~dp0"
+echo.
+echo Repo: "%cd%"
 
-echo ==========================================================
-echo   Git Sync - 一鍵提交、更新並推送到 GitHub
-echo   目前資料夾：%CD%
-echo ==========================================================
-
-rem 檢查是否已安裝 Git
-where git >nul 2>&1
+REM Check Git availability
+git --version >nul 2>&1
 if errorlevel 1 (
-  echo [錯誤] 找不到 git，請先安裝 Git for Windows 再重試。
+  echo [ERROR] Git is not installed or not in PATH.
   pause
   exit /b 1
 )
 
-rem 檢查是否為 Git 專案
-if not exist ".git" (
-  echo [錯誤] 這個資料夾不是 Git 專案：缺少 .git 目錄
+REM Check Git repository
+git rev-parse --is-inside-work-tree >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] Current folder is not a Git repository.
   pause
   exit /b 1
 )
 
-rem 取得目前分支名稱
-for /f "delims=" %%i in ('git rev-parse --abbrev-ref HEAD') do set CURRENT_BRANCH=%%i
+REM Make sure this script is never uploaded (local exclude)
+set "_EXCLUDE=.git\info\exclude"
+if not exist ".git\info" mkdir ".git\info" 2>nul
+findstr /x /c:"git_sync.bat" "%_EXCLUDE%" >nul 2>&1 || (echo git_sync.bat>>"%_EXCLUDE%")
 
-if "%CURRENT_BRANCH%"=="" (
-  echo [錯誤] 無法取得目前分支（可能是 detached HEAD）
-  pause
-  exit /b 1
+REM Current branch
+for /f "delims=" %%B in ('git rev-parse --abbrev-ref HEAD') do set "BR=%%B"
+if /i "!BR!"=="HEAD" (
+  echo [INFO] Detached HEAD detected. Using 'main' as default branch.
+  set "BR=main"
 )
 
-rem 檢查是否有設定 origin 遠端
+REM Remote
 git remote get-url origin >nul 2>&1
 if errorlevel 1 (
-  echo [錯誤] 尚未設定遠端 'origin'。
-  echo 建議先執行：
-  echo   git remote add origin https://github.com/<你的帳號>/<repo>.git
+  echo [ERROR] Remote 'origin' is not configured.
+  echo        Run:  git remote add origin https://github.com/<your-account>/<repo>.git
   pause
   exit /b 1
 )
+for /f "delims=" %%U in ('git remote get-url origin') do set "REMOTE_URL=%%U"
+echo Branch: !BR!
+echo Remote: !REMOTE_URL!
 
-echo 目前分支：%CURRENT_BRANCH%
+REM Commit message
 echo.
+set "MSG="
+set /p MSG=Commit message (default: update): 
+if "!MSG!"=="" set "MSG=update"
 
-set /p COMMIT_MSG=請輸入此次提交的 commit 訊息（直接 Enter 會使用預設 "update"）： 
-if "%COMMIT_MSG%"=="" set COMMIT_MSG=update
-
+REM Stage and commit first (so workspace is clean for rebase)
 echo.
-echo [1/4] 追蹤並加入所有變更...
+echo === Adding changes ===
 git add -A
 
-echo [2/4] 提交變更（若無變更會略過）...
-git diff --cached --quiet && (
-  echo 沒有可提交的變更，略過 commit。
-) || (
-  git commit -m "%COMMIT_MSG%"
+echo.
+echo === Status after add ===
+git status -sb
+
+set "HAS_STAGED="
+for /f "delims=" %%F in ('git diff --cached --name-only') do (
+  set "HAS_STAGED=1"
+  goto :has_staged
+)
+:has_staged
+
+if defined HAS_STAGED (
+  echo.
+  echo === Committing ===
+  git commit -m "!MSG!"
   if errorlevel 1 (
-    echo [錯誤] commit 失敗，請檢查訊息或檔案狀態。
+    echo [ERROR] Commit failed.
     pause
     exit /b 1
   )
+) else (
+  echo.
+  echo [INFO] No staged changes to commit.
 )
 
-echo [3/4] 先拉取遠端更新並 rebase：origin/%CURRENT_BRANCH% ...
-git pull --rebase origin %CURRENT_BRANCH%
-if errorlevel 1 (
-  echo [錯誤] pull --rebase 發生衝突或失敗。請先解決衝突後再執行本工具。
-  pause
-  exit /b 1
+REM Pull with rebase (after commit)
+echo.
+echo === Fetching ===
+git fetch --all --prune
+
+git rev-parse --abbrev-ref --symbolic-full-name @{u} >nul 2>&1
+if not errorlevel 1 (
+  echo.
+  echo === Pulling with rebase ===
+  git pull --rebase
+  if errorlevel 1 (
+    echo [ERROR] Pull --rebase failed. Resolve conflicts (or run ^"git rebase --abort^") and re-run this script.
+    pause
+    exit /b 1
+  )
+) else (
+  echo.
+  echo [INFO] No upstream configured for !BR!. Will set it on push.
 )
 
-echo [4/4] 推送到遠端：origin/%CURRENT_BRANCH% ...
-git push origin %CURRENT_BRANCH%
+REM Push (set upstream if missing)
+echo.
+echo === Pushing ===
+git rev-parse --abbrev-ref --symbolic-full-name @{u} >nul 2>&1
 if errorlevel 1 (
-  echo [錯誤] push 失敗。可能是權限或網路問題（若使用 HTTPS，請使用 Personal Access Token 當密碼）。
+  git push -u origin "!BR!"
+) else (
+  git push
+)
+
+if errorlevel 1 (
+  echo [ERROR] Push failed. If an auth prompt flashed and closed, set credentials:
+  echo   git config --global credential.helper manager
+  echo Then push once in a terminal to store credentials.
   pause
   exit /b 1
 )
 
 echo.
-echo ✅ 完成！已同步到 GitHub：origin/%CURRENT_BRANCH%
+echo Done.
 pause

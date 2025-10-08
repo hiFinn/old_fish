@@ -1,0 +1,6 @@
+streamlit>=1.38
+pandas>=2.2
+plotly>=5.23
+ccxt>=4.3
+requests>=2.32
+tzdata>=2024.1

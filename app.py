@@ -12,14 +12,29 @@ st.set_page_config(page_title="USDT-M 5m 隨機K線（可直接在圖上畫）",
 TIMEFRAME = "5m"
 TZ = "Asia/Taipei"
 
+# -----------------------------------------------------------
+# 連線：先嘗試 Binance Futures；失敗則自動 fallback 到 Binance Spot
+# -----------------------------------------------------------
 @st.cache_resource
-def get_binance_futures_client():
-    ex = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"},
-    })
-    ex.load_markets()
-    return ex
+def get_binance_client():
+    """
+    先嘗試連 Binance Futures；若被封鎖（或其他原因）則自動改用現貨 Spot。
+    回傳 (exchange_instance, mode)；mode 會是 'futures' 或 'spot'
+    """
+    try:
+        ex = ccxt.binance({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+        ex.load_markets()
+        return ex, "futures"
+    except Exception:
+        # Futures 失敗就退回現貨
+        ex = ccxt.binance({
+            "enableRateLimit": True,
+        })
+        ex.load_markets()
+        return ex, "spot"
 
 @st.cache_data(ttl=3600)
 def get_top10_non_stable_bases() -> List[str]:
@@ -50,18 +65,29 @@ def get_top10_non_stable_bases() -> List[str]:
     return ["BTC","ETH","BNB","SOL","XRP","TON","DOGE","ADA","TRX","AVAX"]
 
 @st.cache_data(ttl=1800)
-def build_symbol_choices() -> Tuple[List[str], Dict[str, str]]:
-    ex = get_binance_futures_client()
+def build_symbol_choices() -> Tuple[List[str], Dict[str, str], str]:
+    ex, mode = get_binance_client()
     markets = list(ex.markets.values())
-    usdt_perp = [
-        m for m in markets
-        if m.get("contract") and m.get("linear")
-        and (m.get("swap") or m.get("type") == "swap")
-        and m.get("quote") == "USDT" and m.get("symbol")
-        and (m.get("active", True) is True)
-    ]
+
+    if mode == "futures":
+        # USDT 線性永續
+        usdt_markets = [
+            m for m in markets
+            if m.get("contract") and m.get("linear")
+            and (m.get("swap") or m.get("type") == "swap")
+            and m.get("quote") == "USDT" and m.get("symbol")
+            and (m.get("active", True) is True)
+        ]
+    else:
+        # Spot fallback：抓可交易的 USDT 現貨
+        usdt_markets = [
+            m for m in markets
+            if m.get("spot") and m.get("quote") == "USDT"
+            and m.get("symbol") and (m.get("active", True) is True)
+        ]
+
     display_to_ccxt: Dict[str, str] = {}
-    for m in usdt_perp:
+    for m in usdt_markets:
         base = m.get("base","").upper()
         display = f"{base}/USDT"
         full = m["symbol"]
@@ -92,11 +118,11 @@ def build_symbol_choices() -> Tuple[List[str], Dict[str, str]]:
                 seen.add(d)
             if len(ordered_unique) >= 12:
                 break
-    return ordered_unique, display_to_ccxt
+    return ordered_unique, display_to_ccxt, mode
 
 def fetch_random_segment(symbol_for_api: str, seg_len: int, timeframe: str = TIMEFRAME,
                          tz: str = TZ, window_days: int = 365, max_retries: int = 5) -> pd.DataFrame:
-    ex = get_binance_futures_client()
+    ex, _ = get_binance_client()
     bar_ms = ex.parse_timeframe(timeframe) * 1000
     now_ms = ex.milliseconds()
     max_end = now_ms - bar_ms
@@ -120,15 +146,18 @@ def fetch_random_segment(symbol_for_api: str, seg_len: int, timeframe: str = TIM
 
 # === 側邊欄 ===
 st.sidebar.header("設定")
-choices, display_to_ccxt = build_symbol_choices()
+choices, display_to_ccxt, data_mode = build_symbol_choices()
 default_index = choices.index("BTC/USDT") if "BTC/USDT" in choices else 0
 display_symbol = st.sidebar.selectbox("合約標的", options=choices, index=default_index)
 ccxt_symbol = display_to_ccxt[display_symbol]
 window_days = st.sidebar.slider("隨機範圍（天）", 7, 2000, 750, 1)
 seg_len     = st.sidebar.slider("K棒數量（根）", 20, 300, 120, 1)
 
-st.sidebar.write(f"來源：Binance Futures / {display_symbol} / {TIMEFRAME}")
+source_label = "Binance Futures" if data_mode == "futures" else "Binance Spot（fallback）"
+st.sidebar.write(f"來源：{source_label} / {display_symbol} / {TIMEFRAME}")
 st.sidebar.caption("會從『過去所選天數』內，隨機抓取一段連續的 K 棒。")
+if data_mode == "spot":
+    st.sidebar.info("目前部署環境無法連線到 Binance Futures，已自動改用現貨資料（K 線與永續可能略有差異）。")
 
 # === 狀態 ===
 def need_refresh() -> bool:
@@ -136,6 +165,7 @@ def need_refresh() -> bool:
     if st.session_state.get("last_symbol_display") != display_symbol: return True
     if st.session_state.get("last_window_days") != window_days: return True
     if st.session_state.get("last_seg_len") != seg_len: return True
+    if st.session_state.get("last_data_mode") != data_mode: return True
     return False
 
 if need_refresh():
@@ -143,6 +173,7 @@ if need_refresh():
     st.session_state.last_symbol_display = display_symbol
     st.session_state.last_window_days = window_days
     st.session_state.last_seg_len = seg_len
+    st.session_state.last_data_mode = data_mode
 
 col1, col2 = st.columns([1, 1])
 with col1:
@@ -167,7 +198,7 @@ def make_download_filename(symbol_display: str) -> str:
 
 filename = make_download_filename(display_symbol)
 
-title = f"{display_symbol}（Binance Futures）— 5分K（{seg_len} 根）"
+title = f"{display_symbol}（{source_label}）— 5分K（{seg_len} 根）"
 fig = go.Figure(data=[go.Candlestick(
     x=seg["ts"], open=seg["open"], high=seg["high"], low=seg["low"], close=seg["close"],
     increasing_line_color="#ef5350", decreasing_line_color="#26a69a", line_width=1
